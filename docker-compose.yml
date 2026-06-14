@@ -1,0 +1,99 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: social_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-social}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-social}
+      POSTGRES_DB: ${POSTGRES_DB:-social}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-social}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: social_redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: social_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Creates the media bucket on startup and makes it public-read.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-minioadmin};
+      mc mb -p local/${S3_BUCKET:-media};
+      mc anonymous set download local/${S3_BUCKET:-media};
+      exit 0;
+      "
+
+  migrate:
+    image: flyway/flyway:10-alpine
+    command: -url=jdbc:postgresql://postgres:5432/${POSTGRES_DB:-social} -user=${POSTGRES_USER:-social} -password=${POSTGRES_PASSWORD:-social} -connectRetries=10 migrate
+    volumes:
+      - ./db/migrations:/flyway/sql
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: social_app
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-social}:${POSTGRES_PASSWORD:-social}@postgres:5432/${POSTGRES_DB:-social}
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://minio:9000
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:

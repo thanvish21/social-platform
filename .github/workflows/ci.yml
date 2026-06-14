@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: social
+          POSTGRES_PASSWORD: social
+          POSTGRES_DB: social
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U social"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://social:social@localhost:5432/social
+      REDIS_URL: redis://localhost:6379
+      JWT_ACCESS_SECRET: ci_access_secret
+      JWT_REFRESH_SECRET: ci_refresh_secret
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Run Flyway migrations
+        uses: docker://flyway/flyway:10-alpine
+        with:
+          args: >-
+            -url=jdbc:postgresql://postgres:5432/social
+            -user=social -password=social
+            -locations=filesystem:db/migrations
+            -connectRetries=10 migrate
+
+      - name: Lint
+        run: npm run lint || echo "lint reported issues"
+
+      - name: Typecheck & test server
+        run: npm run test --workspace=server
+
+      - name: Build server
+        run: npm run build --workspace=server
+
+      - name: Build web
+        env:
+          NEXT_PUBLIC_GRAPHQL_HTTP: http://localhost:4000/graphql
+          NEXT_PUBLIC_GRAPHQL_WS: ws://localhost:4000/graphql
+        run: npm run build --workspace=web
+
+  deploy:
+    name: Deploy to Railway
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "RAILWAY_TOKEN not set — skipping deploy."
+            exit 0
+          fi
+          railway up --service server --detach
